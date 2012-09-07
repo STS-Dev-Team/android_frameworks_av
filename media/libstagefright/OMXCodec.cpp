@@ -2300,14 +2300,13 @@ void OMXCodec::handle_extradata(void *data)
 #endif
 
 void OMXCodec::on_message(const omx_message &msg) {
+    // even in error state, we still need to process EMPTY_BUFFER_DONE
+    // and FILL_BUFFER_DONE event, or we will run into mediaserver crash issue
     if (mState == ERROR) {
-#ifdef OMAP_ENHANCEMENT
-        /* Dropping buffers return from client will cause problem in freeing so process them */
-        ALOGW("Dropping OMX message - we're in ERROR state. msg.type: %d",msg.type);
-#else
-        ALOGW("Dropping OMX message - we're in ERROR state.");
-        return;
-#endif
+        if (msg.type == omx_message::EVENT) {
+            ALOGW("Dropping OMX message - we're in ERROR state.");
+            return;
+        }
     }
 
     switch (msg.type) {
