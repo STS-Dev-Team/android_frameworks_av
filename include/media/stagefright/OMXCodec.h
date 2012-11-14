@@ -103,9 +103,13 @@ struct OMXCodec : public MediaSource,
         kDecoderLiesAboutNumberOfChannels     = 256,
         kInputBufferSizesAreBogus             = 512,
         kSupportsMultipleFramesPerInputBuffer = 1024,
-        kAvoidMemcopyInputRecordingFrames     = 2048,
-        kRequiresLargerEncoderOutputBuffer    = 4096,
-        kOutputBuffersAreUnreadable           = 8192,
+        kRequiresLargerEncoderOutputBuffer    = 2048,
+        kOutputBuffersAreUnreadable           = 4096,
+    };
+
+    struct CodecNameAndQuirks {
+        String8 mName;
+        uint32_t mQuirks;
     };
 
     // for use by ACodec
@@ -113,8 +117,7 @@ struct OMXCodec : public MediaSource,
             const char *mime,
             bool createEncoder, const char *matchComponentName,
             uint32_t flags,
-            Vector<String8> *matchingCodecs,
-            Vector<uint32_t> *matchingCodecQuirks = NULL);
+            Vector<CodecNameAndQuirks> *matchingCodecNamesAndQuirks);
 
     static uint32_t getComponentQuirks(
             const MediaCodecList *list, size_t index);
@@ -278,7 +281,7 @@ private:
             CodecProfileLevel& profileLevel);
 
     status_t setVideoOutputFormat(
-            const char *mime, OMX_U32 width, OMX_U32 height);
+            const char *mime, const sp<MetaData>& meta);
 
     void setImageOutputFormat(
             OMX_COLOR_FORMATTYPE format, OMX_U32 width, OMX_U32 height);
@@ -347,8 +350,6 @@ private:
 
     status_t configureCodec(const sp<MetaData> &meta);
 
-    void restorePatchedDataPointer(BufferInfo *info);
-
     status_t applyRotation();
     status_t waitForBufferFilled_l();
 
@@ -357,6 +358,8 @@ private:
     status_t parseAVCCodecSpecificData(
             const void *data, size_t size,
             unsigned *profile, unsigned *level);
+
+    status_t stopOmxComponent_l();
 
     OMXCodec(const OMXCodec &);
     OMXCodec &operator=(const OMXCodec &);

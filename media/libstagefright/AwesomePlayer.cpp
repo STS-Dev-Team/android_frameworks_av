@@ -171,7 +171,7 @@ struct AwesomeNativeWindowRenderer : public AwesomeRenderer {
         CHECK(buffer->meta_data()->findInt64(kKeyTime, &timeUs));
         native_window_set_buffers_timestamp(mNativeWindow.get(), timeUs * 1000);
         status_t err = mNativeWindow->queueBuffer(
-                mNativeWindow.get(), buffer->graphicBuffer().get());
+                mNativeWindow.get(), buffer->graphicBuffer().get(), -1);
         if (err != 0) {
             ALOGE("queueBuffer failed with error %s (%d)", strerror(-err),
                     -err);
@@ -229,6 +229,7 @@ AwesomePlayer::AwesomePlayer()
     : mQueueStarted(false),
       mUIDValid(false),
       mTimeSource(NULL),
+      mVideoRenderingStarted(false),
       mVideoRendererIsPreview(false),
       mAudioPlayer(NULL),
       mDisplayWidth(0),
@@ -336,11 +337,7 @@ status_t AwesomePlayer::setDataSource_l(
         }
     }
 
-    if (!(mFlags & INCOGNITO)) {
-        ALOGI("setDataSource_l('%s')", mUri.string());
-    } else {
-        ALOGI("setDataSource_l(URL suppressed)");
-    }
+    ALOGI("setDataSource_l(URL suppressed)");
 
     // The actual work will be done during preparation in the call to
     // ::finishSetDataSource_l to avoid blocking the calling thread in
@@ -527,7 +524,11 @@ status_t AwesomePlayer::setDataSource_l(const sp<MediaExtractor> &extractor) {
     }
 
     if (!haveAudio && !haveVideo) {
-        return UNKNOWN_ERROR;
+        if (mWVMExtractor != NULL) {
+            return mWVMExtractor->getError();
+        } else {
+            return UNKNOWN_ERROR;
+        }
     }
 
     mExtractorFlags = extractor->flags();
@@ -541,6 +542,7 @@ void AwesomePlayer::reset() {
 }
 
 void AwesomePlayer::reset_l() {
+    mVideoRenderingStarted = false;
     mActiveAudioTrackIndex = -1;
     mDisplayWidth = 0;
     mDisplayHeight = 0;
@@ -787,7 +789,6 @@ void AwesomePlayer::onBufferingUpdate() {
                              kHighWaterMarkBytes);
                         modifyFlags(CACHE_UNDERRUN, CLEAR);
                         play_l();
-                        notifyListener_l(MEDIA_INFO, MEDIA_INFO_BUFFERING_END);
                     } else if (mFlags & PREPARING) {
                         ALOGV("cache has filled up (> %d), prepare is done",
                              kHighWaterMarkBytes);
@@ -831,23 +832,18 @@ void AwesomePlayer::onBufferingUpdate() {
         if ((mFlags & PLAYING) && !eos
                 && (cachedDurationUs < kLowWaterMarkUs)) {
             modifyFlags(CACHE_UNDERRUN, SET);
-            if (mWVMExtractor == NULL) {
-                ALOGI("cache is running low (%.2f secs) , pausing.",
-                      cachedDurationUs / 1E6);
-                pause_l();
-                ensureCacheIsFetching_l();
-                sendCacheStats();
-            }
+            ALOGI("cache is running low (%.2f secs) , pausing.",
+                  cachedDurationUs / 1E6);
+            pause_l();
+            ensureCacheIsFetching_l();
+            sendCacheStats();
             notifyListener_l(MEDIA_INFO, MEDIA_INFO_BUFFERING_START);
         } else if (eos || cachedDurationUs > kHighWaterMarkUs) {
             if (mFlags & CACHE_UNDERRUN) {
                 modifyFlags(CACHE_UNDERRUN, CLEAR);
-                if (mWVMExtractor == NULL) {
-                    ALOGI("cache has filled up (%.2f secs), resuming.",
-                          cachedDurationUs / 1E6);
-                    play_l();
-                }
-                notifyListener_l(MEDIA_INFO, MEDIA_INFO_BUFFERING_END);
+                ALOGI("cache has filled up (%.2f secs), resuming.",
+                      cachedDurationUs / 1E6);
+                play_l();
             } else if (mFlags & PREPARING) {
                 ALOGV("cache has filled up (%.2f secs), prepare is done",
                      cachedDurationUs / 1E6);
@@ -861,9 +857,14 @@ void AwesomePlayer::onBufferingUpdate() {
 
 void AwesomePlayer::sendCacheStats() {
     sp<MediaPlayerBase> listener = mListener.promote();
-    if (listener != NULL && mCachedSource != NULL) {
+    if (listener != NULL) {
         int32_t kbps = 0;
-        status_t err = mCachedSource->getEstimatedBandwidthKbps(&kbps);
+        status_t err = UNKNOWN_ERROR;
+        if (mCachedSource != NULL) {
+            err = mCachedSource->getEstimatedBandwidthKbps(&kbps);
+        } else if (mWVMExtractor != NULL) {
+            err = mWVMExtractor->getEstimatedBandwidthKbps(&kbps);
+        }
         if (err == OK) {
             listener->sendEvent(
                 MEDIA_INFO, MEDIA_INFO_NETWORK_BANDWIDTH, kbps);
@@ -1620,6 +1621,7 @@ status_t AwesomePlayer::initVideoDecoder(uint32_t flags) {
         status_t err = mVideoSource->start();
 
         if (err != OK) {
+            ALOGE("failed to start video source");
             mVideoSource.clear();
             return err;
         }
@@ -1836,7 +1838,8 @@ void AwesomePlayer::onVideoEvent() {
         }
     }
 
-    if ((mFlags & TEXTPLAYER_INITIALIZED) && !(mFlags & (TEXT_RUNNING | SEEK_PREVIEW))) {
+    if ((mFlags & TEXTPLAYER_INITIALIZED)
+            && !(mFlags & (TEXT_RUNNING | SEEK_PREVIEW))) {
         mTextDriver->start();
         modifyFlags(TEXT_RUNNING, SET);
     }
@@ -1893,21 +1896,15 @@ void AwesomePlayer::onVideoEvent() {
                 && mAudioPlayer != NULL
                 && mAudioPlayer->getMediaTimeMapping(
                     &realTimeUs, &mediaTimeUs)) {
-#ifdef OMAP_ENHANCEMENT
-            if (mDebugFps != 0) {
-                ALOGD("we're much too late (%.2f secs), video skipping ahead",
-                      latenessUs / 1E6);
-            }
-#else
-            ALOGI("we're much too late (%.2f secs), video skipping ahead",
-                 latenessUs / 1E6);
-#endif
+            if (mWVMExtractor == NULL) {
+                ALOGI("we're much too late (%.2f secs), video skipping ahead",
+                     latenessUs / 1E6);
 
-            mVideoBuffer->release();
-            mVideoBuffer = NULL;
+                mVideoBuffer->release();
+                mVideoBuffer = NULL;
 
-            mSeeking = SEEK_VIDEO_ONLY;
-            mSeekTimeUs = mediaTimeUs;
+                mSeeking = SEEK_VIDEO_ONLY;
+                mSeekTimeUs = mediaTimeUs;
 
 #if defined(OMAP_ENHANCEMENT) && defined(OMAP_TIME_INTERPOLATOR)
             postVideoEvent_l(0);
@@ -1915,6 +1912,12 @@ void AwesomePlayer::onVideoEvent() {
             postVideoEvent_l();
 #endif
             return;
+            } else {
+                // The widevine extractor doesn't deal well with seeking
+                // audio and video independently. We'll just have to wait
+                // until the decoder catches up, which won't be long at all.
+                ALOGI("we're very late (%.2f secs)", latenessUs / 1E6);
+            }
         }
 
         if (latenessUs > 40000) {
@@ -1980,6 +1983,11 @@ void AwesomePlayer::onVideoEvent() {
     if (mVideoRenderer != NULL) {
         mSinceLastDropped++;
         mVideoRenderer->render(mVideoBuffer);
+        if (!mVideoRenderingStarted) {
+            mVideoRenderingStarted = true;
+            notifyListener_l(MEDIA_INFO, MEDIA_INFO_RENDERING_START);
+        }
+
     }
 
     mVideoBuffer->release();
@@ -2765,7 +2773,7 @@ status_t AwesomePlayer::dump(int fd, const Vector<String16> &args) const {
 
     fprintf(out, " AwesomePlayer\n");
     if (mStats.mFd < 0) {
-        fprintf(out, "  URI(%s)", mStats.mURI.string());
+        fprintf(out, "  URI(suppressed)");
     } else {
         fprintf(out, "  fd(%d)", mStats.mFd);
     }
@@ -2814,6 +2822,9 @@ void AwesomePlayer::modifyFlags(unsigned value, FlagMode mode) {
             mFlags |= value;
             break;
         case CLEAR:
+            if ((value & CACHE_UNDERRUN) && (mFlags & CACHE_UNDERRUN)) {
+                notifyListener_l(MEDIA_INFO, MEDIA_INFO_BUFFERING_END);
+            }
             mFlags &= ~value;
             break;
         case ASSIGN:
